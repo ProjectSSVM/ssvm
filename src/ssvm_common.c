@@ -11,28 +11,16 @@
 #include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/statvfs.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 #include <linux/fs.h>
 #include <linux/loop.h>
 
-static const char *g_prog = "ssvm";
-
-void ssvm_set_prog(const char *argv0)
-{
-    const char *slash = strrchr(argv0, '/');
-    g_prog = slash ? slash + 1 : argv0;
-}
-
-const char *ssvm_prog(void)
-{
-    return g_prog;
-}
-
 void ssvm_die(int code, const char *fmt, ...)
 {
     va_list ap;
-    fprintf(stderr, "%s: ", g_prog);
+    fprintf(stderr, "E: ");
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
@@ -44,7 +32,7 @@ void ssvm_sysdie(int code, const char *fmt, ...)
 {
     int e = errno;
     va_list ap;
-    fprintf(stderr, "%s: ", g_prog);
+    fprintf(stderr, "E: ");
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
@@ -55,7 +43,7 @@ void ssvm_sysdie(int code, const char *fmt, ...)
 void ssvm_warn(const char *fmt, ...)
 {
     va_list ap;
-    fprintf(stderr, "%s: warning: ", g_prog);
+    fprintf(stderr, "W: ");
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
@@ -145,7 +133,7 @@ int ssvm_valid_tag(const char *s)
 int ssvm_parse_lvpath(const char *s, char *vg, char *tp, char *lv)
 {
     char buf[SSVM_PATHSTR_MAX];
-    char *parts[4], *save = NULL;
+    char *parts[5], *save = NULL;
     int n = 0;
 
     if (strlen(s) >= sizeof buf)
@@ -153,18 +141,18 @@ int ssvm_parse_lvpath(const char *s, char *vg, char *tp, char *lv)
     strcpy(buf, s);
 
     for (char *tok = strtok_r(buf, "/", &save); tok; tok = strtok_r(NULL, "/", &save)) {
-        if (n >= 3)
+        if (n >= 4)
             return -1;
         parts[n++] = tok;
     }
-    if (n != 2 && n != 3)
+    if (n < 2 || n > 4)
         return -1;
     for (int i = 0; i < n; i++)
         if (!ssvm_valid_name(parts[i]))
             return -1;
 
     strcpy(vg, parts[0]);
-    if (n == 3) {
+    if (n >= 3) {
         strcpy(tp, parts[1]);
         strcpy(lv, parts[2]);
     } else {
@@ -226,6 +214,189 @@ int ssvm_mp_covers(const char *mp, const char *path)
     if (memcmp(mp, path, ml) != 0)
         return 0;
     return ml == pl || path[ml] == '/';
+}
+
+static int read_first_line(const char *path, char *buf, size_t n)
+{
+    FILE *f = fopen(path, "r");
+    size_t l;
+
+    if (!f)
+        return -1;
+    if (!fgets(buf, (int)n, f)) {
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    l = strlen(buf);
+    while (l > 0 && (buf[l - 1] == '\n' || buf[l - 1] == '\r'))
+        buf[--l] = '\0';
+    return 0;
+}
+
+static void unescape_dashes(char *dst, size_t n, const char *src, size_t len)
+{
+    size_t i = 0, o = 0;
+
+    while (i < len && o + 1 < n) {
+        if (src[i] == '-' && i + 1 < len && src[i + 1] == '-') {
+            dst[o++] = '-';
+            i += 2;
+        } else {
+            dst[o++] = src[i++];
+        }
+    }
+    dst[o] = '\0';
+}
+
+static int lvm_pool_of(const char *dir, const char *vg, const char *lv,
+                       char *pool, size_t n)
+{
+    char path[SSVM_MPT_MAX + SSVM_NAME_MAX + 8];
+    char line[1024];
+    FILE *f;
+    int depth = 0, in_lvs = 0, in_target = 0, found = 0, ispool = 0;
+
+    pool[0] = '\0';
+    if (snprintf(path, sizeof path, "%s/%s", dir, vg) >= (int)sizeof path)
+        return -1;
+    f = fopen(path, "r");
+    if (!f)
+        return -1;
+    while (fgets(line, sizeof line, f)) {
+        char *s = line;
+        size_t l;
+
+        while (*s == ' ' || *s == '\t')
+            s++;
+        l = strlen(s);
+        while (l > 0 && (s[l - 1] == '\n' || s[l - 1] == '\r' ||
+                         s[l - 1] == ' ' || s[l - 1] == '\t'))
+            s[--l] = '\0';
+        if (!l || *s == '#')
+            continue;
+        if (s[l - 1] == '{') {
+            s[l - 1] = '\0';
+            l--;
+            while (l > 0 && (s[l - 1] == ' ' || s[l - 1] == '\t'))
+                s[--l] = '\0';
+            depth++;
+            if (depth == 2 && strcmp(s, "logical_volumes") == 0)
+                in_lvs = 1;
+            else if (depth == 3 && in_lvs && strcmp(s, lv) == 0)
+                in_target = 1;
+            continue;
+        }
+        if (strcmp(s, "}") == 0) {
+            if (depth == 3)
+                in_target = 0;
+            if (depth == 2)
+                in_lvs = 0;
+            if (depth > 0)
+                depth--;
+            continue;
+        }
+        if (in_target && depth >= 3) {
+            char v[SSVM_NAME_MAX];
+            if (sscanf(s, "pool = \"%63[^\"]\"", v) == 1) {
+                snprintf(pool, n, "%s", v);
+                found = 1;
+            } else if (sscanf(s, "type = \"%63[^\"]\"", v) == 1 &&
+                       strcmp(v, "thin-pool") == 0) {
+                ispool = 1;
+            }
+        }
+    }
+    fclose(f);
+    if (ispool) {
+        pool[0] = '\0';
+        return -1;
+    }
+    return found ? 0 : -1;
+}
+
+int ssvm_lvm_detect(const char *refdir, char *vg, char *tp, char *lv)
+{
+    char dev[32];
+    char uuid[128];
+    char name[256];
+    char p[SSVM_MPT_MAX + 128];
+    const char *env;
+
+    env = getenv(SSVM_LVM_DEV_ENV);
+    if (env && *env) {
+        snprintf(dev, sizeof dev, "%s", env);
+    } else {
+        char cur[SSVM_MPT_MAX + 8];
+        struct stat st;
+
+        snprintf(cur, sizeof cur, "%s", refdir ? refdir : "/");
+        for (;;) {
+            if (stat(cur, &st) == 0)
+                break;
+            {
+                char *slash = strrchr(cur, '/');
+                if (!slash || slash == cur) {
+                    if (stat("/", &st) != 0)
+                        return -1;
+                    snprintf(cur, sizeof cur, "/");
+                    break;
+                }
+                *slash = '\0';
+            }
+        }
+        snprintf(dev, sizeof dev, "%u:%u", major(st.st_dev), minor(st.st_dev));
+    }
+
+    env = getenv(SSVM_LVM_SYSFS_ENV);
+    if (!env || !*env)
+        env = "/sys";
+    if (snprintf(p, sizeof p, "%s/dev/block/%s/dm/uuid", env, dev) >=
+        (int)sizeof p)
+        return -1;
+    if (read_first_line(p, uuid, sizeof uuid) != 0)
+        return -1;
+    if (strncmp(uuid, "LVM-", 4) != 0)
+        return -1;
+    if (snprintf(p, sizeof p, "%s/dev/block/%s/dm/name", env, dev) >=
+        (int)sizeof p)
+        return -1;
+    if (read_first_line(p, name, sizeof name) != 0 || !name[0])
+        return -1;
+
+    {
+        size_t i = 0;
+
+        while (name[i]) {
+            if (name[i] == '-') {
+                if (name[i + 1] == '-') {
+                    i += 2;
+                    continue;
+                }
+                break;
+            }
+            i++;
+        }
+        if (!name[i] || i == 0 || !name[i + 1])
+            return -1;
+        unescape_dashes(vg, SSVM_NAME_MAX, name, i);
+        unescape_dashes(lv, SSVM_NAME_MAX, name + i + 1, strlen(name + i + 1));
+    }
+    if (!ssvm_valid_name(vg) || !ssvm_valid_name(lv))
+        return -1;
+
+    tp[0] = '\0';
+    env = getenv(SSVM_LVM_BACKUP_ENV);
+    if (!env || !*env)
+        env = "/etc/lvm/backup";
+    {
+        char pool[SSVM_NAME_MAX];
+
+        if (lvm_pool_of(env, vg, lv, pool, sizeof pool) == 0 &&
+            pool[0] && strcmp(pool, lv) != 0 && ssvm_valid_name(pool))
+            snprintf(tp, SSVM_NAME_MAX, "%s", pool);
+    }
+    return 0;
 }
 
 int ssvm_parse_size(const char *s, uint64_t *out)
@@ -743,6 +914,29 @@ struct ssvm_subvol *ssvm_index_find(struct ssvm_index *ix, const char *path)
     return NULL;
 }
 
+struct ssvm_subvol *ssvm_index_resolve(struct ssvm_index *ix, const char *ref,
+                                       int *nmatch)
+{
+    struct ssvm_subvol *found = NULL;
+    int c = 0;
+
+    *nmatch = 0;
+    if (strchr(ref, '/')) {
+        *nmatch = 1;
+        return ssvm_index_find(ix, ref);
+    }
+    for (size_t i = 0; i < ix->n; i++) {
+        const char *last = strrchr(ix->v[i].path, '/');
+        last = last ? last + 1 : ix->v[i].path;
+        if (strcmp(last, ref) == 0) {
+            found = &ix->v[i];
+            c++;
+        }
+    }
+    *nmatch = c;
+    return c == 1 ? found : NULL;
+}
+
 int ssvm_index_lock(void)
 {
     char path[SSVM_MPT_MAX + 64];
@@ -768,8 +962,8 @@ int ssvm_index_lock(void)
 
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
         if (errno == EWOULDBLOCK) {
-            fprintf(stderr, "%s: waiting for index lock %s "
-                    "(another ssvm command is running)...\n", g_prog, path);
+            fprintf(stderr, "W: waiting for the index lock %s "
+                    "(another ssvm command is running)...\n", path);
             if (flock(fd, LOCK_EX) != 0) {
                 close(fd);
                 ssvm_sysdie(EXIT_SYSTEM, "cannot lock %s", path);
@@ -1293,8 +1487,8 @@ int ssvm_confirm(const char *what)
     char line[128];
 
     if (!isatty(0)) {
-        fprintf(stderr, "%s: confirmation required, but stdin is not a "
-                        "terminal (use -f to force)\n", g_prog);
+        fprintf(stderr, "E: confirmation required, but stdin is not a "
+                        "terminal (use -f to force)\n");
         exit(EXIT_USAGE);
     }
     printf("Remove %s? [y/N] ", what);

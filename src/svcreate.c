@@ -11,12 +11,16 @@
 static void usage(FILE *out)
 {
     fputs(
-"Usage: svcreate [-s SIZE] [-f FSTYPE] [-m MOUNTPOINT] [--tag TAG]... vg/lv\n"
-"       svcreate ... vg/thinpool/lv        (SSVM " SSVM_VERSION ")\n"
+"Usage: svcreate [-s SIZE] [-f FSTYPE] [-m MOUNTPOINT] [--tag TAG]... NAME\n"
+"                                                     (SSVM " SSVM_VERSION ")\n"
 "\n"
-"Creates a subvolume: a sparse .sbv image in a custom format\n"
+"Creates a subvolume named NAME: a sparse .sbv image in a custom format\n"
 "(1 MiB header + filesystem data region) registered in index.xml.\n"
 "\n"
+"  NAME        plain subvolume name — the vg/[thin-pool/]lv prefix of\n"
+"              its path is detected automatically from the real LVM\n"
+"              layout where the mountpoint lives (or where the ssvm\n"
+"              directory lives, when -m is not given)\n"
 "  -s SIZE     virtual size (e.g. 512M, 20G, 1T). Without -s, uses all\n"
 "              free space available at creation time (thin provisioning)\n"
 "  -f FSTYPE   filesystem in the data region: ext2, ext3, ext4, xfs or\n"
@@ -26,10 +30,14 @@ static void usage(FILE *out)
 "              64M for xfs and f2fs)\n"
 "  -m PATH     custom mountpoint: any absolute path, even a single\n"
 "              component such as /a (system directories like /etc are\n"
-"              refused). Default: the mnt/ subdirectory inside the\n"
-"              subvolume, /var/ssvm/vg/[tp/]lv/mnt\n"
+"              refused). LVM detection follows this path. Default: the\n"
+"              mnt/ subdirectory inside the subvolume\n"
 "  --tag TAG   attaches a tag (repeatable)\n"
 "  -h, --help  this help\n"
+"\n"
+"LVM is mandatory: when no LVM logical volume backs the reference\n"
+"path, svcreate fails with\n"
+"  E: LVM Usage is Mandatory on the mountpoint.\n"
 "\n"
 "Exit codes: 0 ok · 1 invalid usage · 3 already exists · 4 system error\n",
     out);
@@ -45,13 +53,16 @@ int main(int argc, char **argv)
     int fs_from_host = 0;
     char tags[SSVM_MAX_TAGS][SSVM_TAG_MAX];
     char path[SSVM_PATHSTR_MAX];
+    char prefix[SSVM_PATHSTR_MAX];
+    char name[SSVM_NAME_MAX + 1];
     struct option lo[] = {
         { "tag",  required_argument, NULL, 'T' },
         { "fs",   required_argument, NULL, 'f' },
         { "help", no_argument,       NULL, 'h' },
         { NULL, 0, NULL, 0 }
     };
-    char vg[SSVM_PATHSTR_MAX], tp[SSVM_PATHSTR_MAX], lv[SSVM_PATHSTR_MAX];
+    char vg[SSVM_NAME_MAX], tp[SSVM_NAME_MAX], lv[SSVM_NAME_MAX];
+    const char *lvmref;
     struct ssvm_index ix;
     struct ssvm_subvol *sv;
     struct sbv_hdr hdr;
@@ -59,7 +70,6 @@ int main(int argc, char **argv)
     char file[SSVM_MPT_MAX + SSVM_PATHSTR_MAX + SSVM_NAME_MAX + 16];
     char sz[32];
 
-    ssvm_set_prog(argv[0]);
     opterr = 0;
     while ((opt = getopt_long(argc, argv, "s:m:f:h", lo, NULL)) != -1) {
         switch (opt) {
@@ -100,10 +110,13 @@ int main(int argc, char **argv)
         usage(stderr);
         return EXIT_USAGE;
     }
-    snprintf(path, sizeof path, "%s", argv[optind]);
-    if (ssvm_parse_lvpath(path, vg, tp, lv) != 0)
-        ssvm_die(EXIT_USAGE, "invalid path: %s "
-                 "(use vg/lv or vg/thinpool/lv)", path);
+    if (strchr(argv[optind], '/'))
+        ssvm_die(EXIT_USAGE, "pass a plain NAME — the vg/[thin-pool/]lv "
+                 "prefix is auto-detected from the mountpoint: %s",
+                 argv[optind]);
+    if (!ssvm_valid_name(argv[optind]))
+        ssvm_die(EXIT_USAGE, "invalid name: %s", argv[optind]);
+    snprintf(name, sizeof name, "%s", argv[optind]);
     if (mp && !ssvm_valid_mountpoint(mp))
         ssvm_die(EXIT_USAGE, "invalid mountpoint: %s "
                  "(absolute path, no '..', not a system directory)",
@@ -115,6 +128,18 @@ int main(int argc, char **argv)
     if (ssvm_index_load(&ix) != 0) {
         ssvm_index_unlock(lockfd);
         return EXIT_SYSTEM;
+    }
+
+    lvmref = mp ? mp : ssvm_dir();
+    if (ssvm_lvm_detect(lvmref, vg, tp, lv) != 0) {
+        ssvm_index_unlock(lockfd);
+        ssvm_die(EXIT_SYSTEM, "LVM Usage is Mandatory on the mountpoint.");
+    }
+    snprintf(prefix, sizeof prefix, "%s%s%s/%s",
+             vg, tp[0] ? "/" : "", tp[0] ? tp : "", lv);
+    if (ssvm_path_join(path, sizeof path, prefix, name) != 0) {
+        ssvm_index_unlock(lockfd);
+        ssvm_die(EXIT_SYSTEM, "path too long");
     }
     if (ssvm_index_find(&ix, path)) {
         ssvm_index_unlock(lockfd);
@@ -199,16 +224,7 @@ int main(int argc, char **argv)
 
     {
         char parent[SSVM_MPT_MAX + SSVM_PATHSTR_MAX + 8];
-        char up[SSVM_PATHSTR_MAX];
-        if (tp[0]) {
-            if (ssvm_path_join(up, sizeof up, vg, tp) != 0) {
-                ssvm_index_unlock(lockfd);
-                ssvm_die(EXIT_SYSTEM, "path too long");
-            }
-        } else {
-            ssvm_strcpy(up, sizeof up, vg);
-        }
-        if (ssvm_path_join(parent, sizeof parent, ssvm_dir(), up) != 0) {
+        if (ssvm_path_join(parent, sizeof parent, ssvm_dir(), prefix) != 0) {
             ssvm_index_unlock(lockfd);
             ssvm_die(EXIT_SYSTEM, "path too long");
         }
@@ -236,7 +252,7 @@ int main(int argc, char **argv)
 
     {
         char base[SSVM_PATHSTR_MAX + 8];
-        snprintf(base, sizeof base, "%s.sbv", lv);
+        snprintf(base, sizeof base, "%s.sbv", name);
         if (ssvm_path_join(file, sizeof file, dir, base) != 0) {
             ssvm_index_unlock(lockfd);
             ssvm_die(EXIT_SYSTEM, "path too long");
@@ -262,7 +278,7 @@ int main(int argc, char **argv)
         ssvm_sysdie(EXIT_SYSTEM, "error writing the header of %s", file);
     }
 
-    if (ssvm_mkfs(file, fstype, lv, size) != 0) {
+    if (ssvm_mkfs(file, fstype, name, size) != 0) {
         ssvm_rm_rf(dir);
         ssvm_index_unlock(lockfd);
         ssvm_sysdie(EXIT_SYSTEM, "failed to format %s as %s", file, fstype);
@@ -317,6 +333,7 @@ int main(int argc, char **argv)
     ssvm_format_size(size, sz, sizeof sz);
     printf("created: %s (%s) [%s]%s\n", path, sz, fstype,
            have_size ? "" : " [thin: all free space]");
+    printf("lvm: %s (detected on %s)\n", prefix, lvmref);
     if (fs_from_host)
         printf("filesystem: %s (host default)\n", fstype);
     {

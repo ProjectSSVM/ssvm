@@ -990,9 +990,8 @@ int ssvm_mkfs(const char *file, const char *fstype, const char *label,
     int rc;
 
     if (getenv(SSVM_NO_MKFS_ENV)) {
-        fprintf(stderr, "%s: warning: %s is set — .sbv created WITHOUT a "
-                        "filesystem (test mode)\n", ssvm_prog(),
-                SSVM_NO_MKFS_ENV);
+        fprintf(stderr, "W: %s is set — .sbv created WITHOUT a "
+                        "filesystem (test mode)\n", SSVM_NO_MKFS_ENV);
         return 0;
     }
     if (!fstype || !*fstype)

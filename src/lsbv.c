@@ -13,7 +13,10 @@ static void usage(FILE *out)
 "\n"
 "Lists SSVM subvolumes registered under /var/ssvm.\n"
 "\n"
-"  path       vg, vg/lv or vg/thinpool/lv (default: all)\n"
+"  path       a subvolume path (vg/[thin-pool/]lv/name — shows the\n"
+"             detail view), its plain name when unique, or any path\n"
+"             prefix such as a vg, a vg/thin-pool or a vg/[tp/]lv\n"
+"             (default: all)\n"
 "  -l         long format (details for each subvolume)\n"
 "  --tag TAG  shows only subvolumes carrying tag TAG\n"
 "  -h, --help this help\n"
@@ -22,11 +25,39 @@ static void usage(FILE *out)
     out);
 }
 
-static void print_short(const struct ssvm_index *ix, const char *onlyvg,
-                        const char *tagfilter)
+static int path_matches(const char *path, const char *prefix,
+                         const char *name)
+{
+    if (prefix) {
+        size_t pl = strlen(prefix);
+
+        if (strncmp(path, prefix, pl) != 0 || path[pl] != '/')
+            return 0;
+    }
+    if (name) {
+        const char *last = strrchr(path, '/');
+
+        last = last ? last + 1 : path;
+        if (strcmp(last, name) != 0)
+            return 0;
+    }
+    return 1;
+}
+
+static int tagfiltered(const struct ssvm_subvol *sv, const char *tagfilter)
+{
+    if (!tagfilter)
+        return 0;
+    for (int t = 0; t < sv->ntags; t++)
+        if (strcmp(sv->tags[t], tagfilter) == 0)
+            return 0;
+    return 1;
+}
+
+static void print_short(const struct ssvm_index *ix, const char *prefix,
+                        const char *name, const char *tagfilter)
 {
     char lastvg[SSVM_NAME_MAX + 1] = "";
-    char lasttp[SSVM_NAME_MAX + 1] = "";
     int anypend = 0;
 
     for (size_t i = 0; i < ix->n; i++) {
@@ -35,9 +66,9 @@ static void print_short(const struct ssvm_index *ix, const char *onlyvg,
         char sz[32], src[128];
         int active;
 
-        if (ssvm_parse_lvpath(sv->path, vg, tp, lv) != 0)
+        if (!path_matches(sv->path, prefix, name))
             continue;
-        if (onlyvg && strcmp(vg, onlyvg) != 0)
+        if (ssvm_parse_lvpath(sv->path, vg, tp, lv) != 0)
             continue;
         if (tagfilter) {
             int hit = 0;
@@ -51,23 +82,20 @@ static void print_short(const struct ssvm_index *ix, const char *onlyvg,
         if (strcmp(lastvg, vg) != 0) {
             printf("%s:\n", vg);
             ssvm_strcpy(lastvg, sizeof lastvg, vg);
-            lasttp[0] = '\0';
-        }
-        if (tp[0] && strcmp(lasttp, tp) != 0) {
-            printf("  %s/\n", tp);
-            ssvm_strcpy(lasttp, sizeof lasttp, tp);
         }
 
         active = ssvm_is_active(sv, src, sizeof src);
         ssvm_format_size(sv->size, sz, sizeof sz);
         {
             char est[24];
+            const char *row = sv->path + strlen(vg) + 1;
+
             snprintf(est, sizeof est, "%s%s",
                      active ? "active" : "inactive",
                      sv->pendrb[0] ? "*" : "");
             if (sv->pendrb[0])
                 anypend = 1;
-            printf("  %-18s %6s  %-8s", lv, sz, est);
+            printf("  %-28s %6s  %-8s", row, sz, est);
         }
         if (sv->ntags > 0) {
             char tags[SSVM_TAG_MAX * SSVM_MAX_TAGS + 4];
@@ -176,7 +204,6 @@ int main(int argc, char **argv)
         { NULL, 0, NULL, 0 }
     };
 
-    ssvm_set_prog(argv[0]);
     opterr = 0;
     while ((opt = getopt_long(argc, argv, "lh", lo, NULL)) != -1) {
         switch (opt) {
@@ -207,15 +234,10 @@ int main(int argc, char **argv)
         return EXIT_SYSTEM;
 
     if (patharg) {
-        char vg[SSVM_PATHSTR_MAX], tp[SSVM_PATHSTR_MAX], lv[SSVM_PATHSTR_MAX];
-        if (ssvm_parse_lvpath(patharg, vg, tp, lv) == 0) {
+        int nm;
+        struct ssvm_subvol *sv = ssvm_index_resolve(&ix, patharg, &nm);
 
-            struct ssvm_subvol *sv = ssvm_index_find(&ix, patharg);
-            if (!sv) {
-                fprintf(stderr, "lsbv: no such subvolume: %s\n", patharg);
-                rc = EXIT_NOENT;
-                goto done;
-            }
+        if (sv) {
             if (tagfilter) {
                 int hit = 0;
                 for (int t = 0; t < sv->ntags; t++)
@@ -225,44 +247,43 @@ int main(int argc, char **argv)
                     goto done;
             }
             print_long(sv);
+        } else if (nm > 1) {
+            if (longmode) {
+                for (size_t i = 0; i < ix.n; i++)
+                    if (path_matches(ix.v[i].path, NULL, patharg) &&
+                        !tagfiltered(&ix.v[i], tagfilter))
+                        print_long(&ix.v[i]);
+            } else {
+                print_short(&ix, NULL, patharg, tagfilter);
+            }
         } else {
-
             int found = 0;
-            if (!ssvm_valid_name(patharg)) {
-                fprintf(stderr, "lsbv: invalid path: %s\n", patharg);
-                rc = EXIT_NOENT;
-                goto done;
-            }
-            for (size_t i = 0; i < ix.n; i++) {
-                size_t vl = strlen(patharg);
-                if (strncmp(ix.v[i].path, patharg, vl) == 0 &&
-                    ix.v[i].path[vl] == '/')
+
+            for (size_t i = 0; i < ix.n; i++)
+                if (path_matches(ix.v[i].path, patharg, NULL))
                     found = 1;
-            }
             if (!found) {
-                fprintf(stderr, "lsbv: nothing found under %s\n", patharg);
+                fprintf(stderr, "E: no such subvolume: %s\n", patharg);
                 rc = EXIT_NOENT;
                 goto done;
             }
             if (longmode) {
-                for (size_t i = 0; i < ix.n; i++) {
-                    char v2[SSVM_PATHSTR_MAX], t2[SSVM_PATHSTR_MAX];
-                    char l2[SSVM_PATHSTR_MAX];
-                    if (ssvm_parse_lvpath(ix.v[i].path, v2, t2, l2) == 0 &&
-                        strcmp(v2, patharg) == 0)
+                for (size_t i = 0; i < ix.n; i++)
+                    if (path_matches(ix.v[i].path, patharg, NULL) &&
+                        !tagfiltered(&ix.v[i], tagfilter))
                         print_long(&ix.v[i]);
-                }
             } else {
-                print_short(&ix, patharg, tagfilter);
+                print_short(&ix, patharg, NULL, tagfilter);
             }
         }
     } else {
         if (ix.n > 0) {
             if (longmode) {
                 for (size_t i = 0; i < ix.n; i++)
-                    print_long(&ix.v[i]);
+                    if (!tagfiltered(&ix.v[i], tagfilter))
+                        print_long(&ix.v[i]);
             } else {
-                print_short(&ix, NULL, tagfilter);
+                print_short(&ix, NULL, NULL, tagfilter);
             }
         }
     }

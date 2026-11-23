@@ -10,11 +10,13 @@
 static void usage(FILE *out)
 {
     fputs(
-"Usage: svremove [-f] vg/lv               removes the subvolume\n"
-"       svremove [-f] vg/lv/NAME.sbvs     removes a snapshot\n"
-"       svremove -t TAG vg/lv             removes only the tag\n"
-"                                             (SSVM " SSVM_VERSION ")\n"
+"Usage: svremove [-f] SUBVOL                 removes the subvolume\n"
+"       svremove [-f] SUBVOL/NAME.sbvs       removes a snapshot\n"
+"       svremove -t TAG SUBVOL               removes only the tag\n"
+"                                                   (SSVM " SSVM_VERSION ")\n"
 "\n"
+"  SUBVOL      subvolume path (vg/[thin-pool/]lv/name) or just its\n"
+"              name, when unique among the registered subvolumes\n"
 "  -f          skips the confirmation prompt\n"
 "  -t TAG      removes only tag TAG from the subvolume (data untouched)\n"
 "  -h, --help  this help\n"
@@ -43,7 +45,7 @@ static int is_snapshot_path(const char *s)
         last = tok;
         n++;
     }
-    if ((n != 3 && n != 4) || !last)
+    if ((n < 3 || n > 5) || !last)
         return 0;
     {
         size_t ll = strlen(last);
@@ -83,7 +85,6 @@ int main(int argc, char **argv)
     char src[128];
     char used[32], sz[32];
 
-    ssvm_set_prog(argv[0]);
     opterr = 0;
     while ((opt = getopt_long(argc, argv, "ft:h", lo, NULL)) != -1) {
         switch (opt) {
@@ -119,14 +120,19 @@ int main(int argc, char **argv)
 
     if (tagrm) {
         int found = -1;
+        int nm;
 
-        if (is_snapshot_path(path) || strchr(path, '/') == NULL)
-            ssvm_die(EXIT_USAGE, "-t expects a subvolume path: vg/lv");
-        sv = ssvm_index_find(&ix, path);
+        if (is_snapshot_path(path))
+            ssvm_die(EXIT_USAGE, "-t expects a subvolume, not a snapshot");
+        sv = ssvm_index_resolve(&ix, path, &nm);
         if (!sv) {
             ssvm_index_unlock(lockfd);
+            if (nm > 1)
+                ssvm_die(EXIT_USAGE, "ambiguous name: %s — use the full path",
+                         path);
             ssvm_die(EXIT_NOENT, "no such subvolume: %s", path);
         }
+        snprintf(path, sizeof path, "%s", sv->path);
         for (int i = 0; i < sv->ntags; i++)
             if (strcmp(sv->tags[i], tagrm) == 0)
                 found = i;
@@ -223,14 +229,27 @@ int main(int argc, char **argv)
 
     {
         char vg[SSVM_PATHSTR_MAX], tp[SSVM_PATHSTR_MAX], lv[SSVM_PATHSTR_MAX];
-        if (ssvm_parse_lvpath(path, vg, tp, lv) != 0)
-            ssvm_die(EXIT_USAGE, "invalid path: %s "
-                     "(vg/lv, vg/tp/lv, vg/lv/NAME.sbvs or -t TAG vg/lv)", path);
+
+        if (strchr(path, '/')) {
+            if (ssvm_parse_lvpath(path, vg, tp, lv) != 0)
+                ssvm_die(EXIT_USAGE, "invalid path: %s (vg/[tp/]lv/name, "
+                         "vg/[tp/]lv/name/SNAP.sbvs or -t TAG SUBVOL)", path);
+        } else if (!ssvm_valid_name(path)) {
+            ssvm_die(EXIT_USAGE, "invalid name: %s", path);
+        }
     }
-    sv = ssvm_index_find(&ix, path);
-    if (!sv) {
-        ssvm_index_unlock(lockfd);
-        ssvm_die(EXIT_NOENT, "no such subvolume: %s", path);
+    {
+        int nm;
+
+        sv = ssvm_index_resolve(&ix, path, &nm);
+        if (!sv) {
+            ssvm_index_unlock(lockfd);
+            if (nm > 1)
+                ssvm_die(EXIT_USAGE, "ambiguous name: %s — use the full path",
+                         path);
+            ssvm_die(EXIT_NOENT, "no such subvolume: %s", path);
+        }
+        snprintf(path, sizeof path, "%s", sv->path);
     }
 
     ssvm_sbv_dir(sv, dir, sizeof dir);

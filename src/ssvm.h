@@ -8,11 +8,14 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 
-#define SSVM_VERSION "1.2"
+#define SSVM_VERSION "1.3"
 
 #define SSVM_DIR_ENV     "SSVM_DIR"
 #define SSVM_NO_MKFS_ENV "SSVM_NO_MKFS"
 #define SSVM_MOUNTS_ENV  "SSVM_MOUNTS"
+#define SSVM_LVM_DEV_ENV     "SSVM_LVM_DEV"
+#define SSVM_LVM_SYSFS_ENV   "SSVM_LVM_SYSFS"
+#define SSVM_LVM_BACKUP_ENV  "SSVM_LVM_BACKUP"
 #define SSVM_DIR_DEFAULT "/var/ssvm"
 #define SSVM_INDEX_NAME  "index.xml"
 #define SSVM_LOCK_NAME   ".index.lock"
@@ -23,7 +26,7 @@
 #define SBV_CHUNK_SIZE   (4u * 1024u * 1024u)
 #define SBV_FLAG_SEALED  0x1u
 
-#define SSVM_PATHSTR_MAX 256
+#define SSVM_PATHSTR_MAX 384
 #define SSVM_NAME_MAX    64
 #define SSVM_TAG_MAX     64
 #define SSVM_MAX_TAGS    32
@@ -91,8 +94,6 @@ void ssvm_sysdie(int code, const char *fmt, ...)
     __attribute__((noreturn, format(printf, 2, 3)));
 void ssvm_warn(const char *fmt, ...)
     __attribute__((format(printf, 1, 2)));
-void ssvm_set_prog(const char *argv0);
-const char *ssvm_prog(void);
 
 const char *ssvm_dir(void);
 void        ssvm_require_root(void);
@@ -107,6 +108,7 @@ int   ssvm_valid_fstype(const char *s);
 uint64_t ssvm_fs_min_size(const char *fstype);
 const char *ssvm_host_fstype(const char *dir);
 int   ssvm_parse_lvpath(const char *s, char *vg, char *tp, char *lv);
+int   ssvm_lvm_detect(const char *refdir, char *vg, char *tp, char *lv);
 int   ssvm_valid_mountpoint(const char *mp);
 int   ssvm_mp_covers(const char *mp, const char *path);
 int   ssvm_parse_size(const char *s, uint64_t *out);
@@ -120,6 +122,8 @@ int                 ssvm_index_load(struct ssvm_index *ix);
 void                ssvm_index_free(struct ssvm_index *ix);
 int                 ssvm_index_save(const struct ssvm_index *ix);
 struct ssvm_subvol *ssvm_index_find(struct ssvm_index *ix, const char *path);
+struct ssvm_subvol *ssvm_index_resolve(struct ssvm_index *ix, const char *ref,
+                                       int *nmatch);
 int                 ssvm_index_lock(void);
 void                ssvm_index_unlock(int fd);
 

@@ -11,12 +11,14 @@
 static void usage(FILE *out)
 {
     fputs(
-"Usage: svchange -ay [-m PATH] vg/lv        activate\n"
-"       svchange -an vg/lv                  deactivate\n"
-"       svchange -s [-n NAME] vg/lv         snapshot\n"
-"       svchange -r SNAPSHOT vg/lv          rollback     (SSVM "
+"Usage: svchange -ay [-m PATH] SUBVOL       activate\n"
+"       svchange -an SUBVOL                  deactivate\n"
+"       svchange -s [-n NAME] SUBVOL         snapshot\n"
+"       svchange -r SNAPSHOT SUBVOL          rollback     (SSVM "
     SSVM_VERSION ")\n"
 "\n"
+"  SUBVOL      subvolume path (vg/[thin-pool/]lv/name) or just its\n"
+"              name, when unique among the registered subvolumes\n"
 "  -ay          activate: attaches a loop device to the .sbv (data region\n"
 "               after the 1 MiB header) and mounts it at the mountpoint\n"
 "  -an          deactivate: unmounts, releases the loop and seals with +i\n"
@@ -82,7 +84,7 @@ static const struct ssvm_snap *find_snap(const struct ssvm_subvol *sv,
 
 int main(int argc, char **argv)
 {
-    int opt, action = 0;
+    int opt, action = 0, nm;
     const char *mpnew = NULL, *snapname = NULL, *rbarg = NULL;
     char path[SSVM_PATHSTR_MAX];
     struct option lo[] = {
@@ -98,7 +100,6 @@ int main(int argc, char **argv)
     struct sbv_hdr hdr;
     int lockfd;
 
-    ssvm_set_prog(argv[0]);
     opterr = 0;
     while ((opt = getopt_long(argc, argv, "a:sn:r:m:h", lo, NULL)) != -1) {
         switch (opt) {
@@ -146,10 +147,13 @@ int main(int argc, char **argv)
         ssvm_die(EXIT_USAGE, "invalid mountpoint: %s", mpnew);
 
     snprintf(path, sizeof path, "%s", argv[optind]);
-    {
+    if (strchr(path, '/')) {
         char vg[SSVM_PATHSTR_MAX], tp[SSVM_PATHSTR_MAX], lv[SSVM_PATHSTR_MAX];
         if (ssvm_parse_lvpath(path, vg, tp, lv) != 0)
-            ssvm_die(EXIT_USAGE, "invalid path: %s", path);
+            ssvm_die(EXIT_USAGE, "invalid path: %s "
+                     "(vg/[tp/]lv/name or a plain unique name)", path);
+    } else if (!ssvm_valid_name(path)) {
+        ssvm_die(EXIT_USAGE, "invalid name: %s", path);
     }
 
     ssvm_require_root();
@@ -159,11 +163,15 @@ int main(int argc, char **argv)
         ssvm_index_unlock(lockfd);
         return EXIT_SYSTEM;
     }
-    sv = ssvm_index_find(&ix, path);
+    sv = ssvm_index_resolve(&ix, path, &nm);
     if (!sv) {
         ssvm_index_unlock(lockfd);
+        if (nm > 1)
+            ssvm_die(EXIT_USAGE, "ambiguous name: %s — use the full path",
+                     path);
         ssvm_die(EXIT_NOENT, "no such subvolume: %s", path);
     }
+    snprintf(path, sizeof path, "%s", sv->path);
 
     ssvm_sbv_dir(sv, dir, sizeof dir);
     ssvm_sbv_file(sv, file, sizeof file);
@@ -577,7 +585,7 @@ int main(int argc, char **argv)
             printf("rollback registered: %s <- %s (%s copied)\n", path,
                    sn->name, used);
             fflush(stdout);
-            fprintf(stderr, "%s: WARNING: %s is MOUNTED — the on-disk image "
+            fprintf(stderr, "W: %s is MOUNTED — the on-disk image "
                     "has been replaced, but the current mount keeps\n"
                     "  running on the old image, which is now VOLATILE: "
                     "data written from now on is NOT persisted and will "
@@ -585,7 +593,7 @@ int main(int argc, char **argv)
                     "  The rollback applies the restored image only on "
                     "remount:\n"
                     "    svchange -an %s && svchange -ay %s\n",
-                    ssvm_prog(), path, path, path);
+                    path, path, path);
         } else {
             printf("rollback applied: %s <- %s (%s copied)\n", path,
                    sn->name, used);
