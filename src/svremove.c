@@ -12,11 +12,15 @@ static void usage(FILE *out)
     fputs(
 "Usage: svremove [-f] SUBVOL                 removes the subvolume\n"
 "       svremove [-f] SUBVOL/NAME.sbvs       removes a snapshot\n"
+"       svremove [-f] SNAPSHOT               removes a snapshot by name\n"
 "       svremove -t TAG SUBVOL               removes only the tag\n"
 "                                                   (SSVM " SSVM_VERSION ")\n"
 "\n"
 "  SUBVOL      subvolume path (vg/[thin-pool/]lv/name) or just its\n"
 "              name, when unique among the registered subvolumes\n"
+"  SNAPSHOT    snapshot name (with or without the .sbvs suffix),\n"
+"              unique among all the registered snapshots — a bare name\n"
+"              that matches a subvolume always resolves to the subvolume\n"
 "  -f          skips the confirmation prompt\n"
 "  -t TAG      removes only tag TAG from the subvolume (data untouched)\n"
 "  -h, --help  this help\n"
@@ -68,6 +72,57 @@ static void split_snapshot_path(const char *s, char *subpath, size_t n)
     snprintf(subpath, n, "%.*s", (int)(cut - 1), s);
 }
 
+static int remove_snapshot(struct ssvm_index *ix, struct ssvm_subvol *sv,
+                           int si, const char *display, int force, int lockfd)
+{
+    char dir[SSVM_MPT_MAX + SSVM_PATHSTR_MAX + 8];
+    char file[SSVM_MPT_MAX + SSVM_PATHSTR_MAX + SSVM_NAME_MAX + 16];
+    char mp[SSVM_MPT_MAX + SSVM_PATHSTR_MAX + 8];
+    char snapfile[SSVM_MPT_MAX + SSVM_PATHSTR_MAX + SSVM_SNAPNAME_MAX + 8];
+    char src[128], used[32];
+    const char *snapname = sv->snaps[si].name;
+
+    ssvm_sbv_dir(sv, dir, sizeof dir);
+    ssvm_sbv_file(sv, file, sizeof file);
+    ssvm_mp_of(sv, mp, sizeof mp);
+    if (ssvm_find_mount(mp, src, sizeof src)) {
+        ssvm_index_unlock(lockfd);
+        ssvm_die(EXIT_CONFLICT, "%s is active — deactivate first "
+                 "(svchange -an)", sv->path);
+    }
+    if (ssvm_path_join(snapfile, sizeof snapfile, dir, snapname) != 0) {
+        ssvm_index_unlock(lockfd);
+        ssvm_die(EXIT_SYSTEM, "path too long");
+    }
+
+    ssvm_format_size(ssvm_used_bytes(snapfile), used, sizeof used);
+    if (!force && !ssvm_confirm(display))
+        ssvm_die(EXIT_USAGE, "aborted");
+
+    ssvm_chattr_i(dir, 0);
+    ssvm_chattr_i(snapfile, 0);
+    if (unlink(snapfile) != 0) {
+        ssvm_chattr_i(dir, 1);
+        ssvm_index_unlock(lockfd);
+        ssvm_sysdie(EXIT_SYSTEM, "cannot remove %s", snapfile);
+    }
+    ssvm_chattr_i(dir, 1);
+
+    for (int i = si; i + 1 < sv->nsnap; i++)
+        sv->snaps[i] = sv->snaps[i + 1];
+    sv->nsnap--;
+
+    if (strcmp(sv->pendrb, snapname) == 0)
+        sv->pendrb[0] = '\0';
+    if (ssvm_index_save(ix) != 0) {
+        ssvm_index_unlock(lockfd);
+        return EXIT_SYSTEM;
+    }
+    ssvm_index_unlock(lockfd);
+    printf("snapshot removed: %s (%s on disk)\n", display, used);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     int opt, force = 0, lockfd;
@@ -83,7 +138,7 @@ int main(int argc, char **argv)
     char file[SSVM_MPT_MAX + SSVM_PATHSTR_MAX + SSVM_NAME_MAX + 16];
     char mp[SSVM_MPT_MAX + SSVM_PATHSTR_MAX + 8];
     char src[128];
-    char used[32], sz[32];
+    char sz[32];
 
     opterr = 0;
     while ((opt = getopt_long(argc, argv, "ft:h", lo, NULL)) != -1) {
@@ -163,7 +218,6 @@ int main(int argc, char **argv)
 
     if (is_snapshot_path(path)) {
         char subpath[SSVM_PATHSTR_MAX];
-        char snapfile[SSVM_MPT_MAX + SSVM_PATHSTR_MAX + SSVM_SNAPNAME_MAX + 8];
         char snapname[SSVM_SNAPNAME_MAX];
         int si = -1;
 
@@ -184,47 +238,11 @@ int main(int argc, char **argv)
             ssvm_index_unlock(lockfd);
             ssvm_die(EXIT_NOENT, "snapshot not found: %s", path);
         }
-
-        ssvm_sbv_dir(sv, dir, sizeof dir);
-        ssvm_sbv_file(sv, file, sizeof file);
-        ssvm_mp_of(sv, mp, sizeof mp);
-        if (ssvm_find_mount(mp, src, sizeof src)) {
-            ssvm_index_unlock(lockfd);
-            ssvm_die(EXIT_CONFLICT, "%s is active — deactivate first "
-                     "(svchange -an)", subpath);
+        {
+            int rc = remove_snapshot(&ix, sv, si, path, force, lockfd);
+            ssvm_index_free(&ix);
+            return rc;
         }
-        if (ssvm_path_join(snapfile, sizeof snapfile, dir, snapname) != 0) {
-            ssvm_index_unlock(lockfd);
-            ssvm_die(EXIT_SYSTEM, "path too long");
-        }
-
-        ssvm_format_size(ssvm_used_bytes(snapfile), used, sizeof used);
-        if (!force && !ssvm_confirm(path))
-            ssvm_die(EXIT_USAGE, "aborted");
-
-        ssvm_chattr_i(dir, 0);
-        ssvm_chattr_i(snapfile, 0);
-        if (unlink(snapfile) != 0) {
-            ssvm_chattr_i(dir, 1);
-            ssvm_index_unlock(lockfd);
-            ssvm_sysdie(EXIT_SYSTEM, "cannot remove %s", snapfile);
-        }
-        ssvm_chattr_i(dir, 1);
-
-        for (int i = si; i + 1 < sv->nsnap; i++)
-            sv->snaps[i] = sv->snaps[i + 1];
-        sv->nsnap--;
-
-        if (strcmp(sv->pendrb, snapname) == 0)
-            sv->pendrb[0] = '\0';
-        if (ssvm_index_save(&ix) != 0) {
-            ssvm_index_unlock(lockfd);
-            return EXIT_SYSTEM;
-        }
-        ssvm_index_unlock(lockfd);
-        printf("snapshot removed: %s (%s on disk)\n", path, used);
-        ssvm_index_free(&ix);
-        return 0;
     }
 
     {
@@ -234,20 +252,41 @@ int main(int argc, char **argv)
             if (ssvm_parse_lvpath(path, vg, tp, lv) != 0)
                 ssvm_die(EXIT_USAGE, "invalid path: %s (vg/[tp/]lv/name, "
                          "vg/[tp/]lv/name/SNAP.sbvs or -t TAG SUBVOL)", path);
-        } else if (!ssvm_valid_name(path)) {
-            ssvm_die(EXIT_USAGE, "invalid name: %s", path);
         }
     }
     {
-        int nm;
+        int nm = 0;
 
         sv = ssvm_index_resolve(&ix, path, &nm);
+        if (!sv && nm == 0) {
+            int si = -1, snm = 0;
+            struct ssvm_subvol *ow = ssvm_snap_find(&ix, path, &si, &snm);
+
+            if (ow && snm == 1) {
+                char disp[SSVM_PATHSTR_MAX + SSVM_SNAPNAME_MAX + 8];
+                snprintf(disp, sizeof disp, "%s/%s", ow->path,
+                         ow->snaps[si].name);
+                {
+                    int rc = remove_snapshot(&ix, ow, si, disp, force,
+                                             lockfd);
+                    ssvm_index_free(&ix);
+                    return rc;
+                }
+            }
+            if (ow && snm > 1) {
+                ssvm_index_unlock(lockfd);
+                ssvm_die(EXIT_USAGE, "ambiguous snapshot name: %s — use the "
+                         "full path vg/[thin-pool/]lv/name/SNAP.sbvs", path);
+            }
+            ssvm_index_unlock(lockfd);
+            if (!ssvm_valid_name(path))
+                ssvm_die(EXIT_USAGE, "invalid name: %s", path);
+            ssvm_die(EXIT_NOENT, "no such subvolume or snapshot: %s", path);
+        }
         if (!sv) {
             ssvm_index_unlock(lockfd);
-            if (nm > 1)
-                ssvm_die(EXIT_USAGE, "ambiguous name: %s — use the full path",
-                         path);
-            ssvm_die(EXIT_NOENT, "no such subvolume: %s", path);
+            ssvm_die(EXIT_USAGE, "ambiguous name: %s — use the full path",
+                     path);
         }
         snprintf(path, sizeof path, "%s", sv->path);
     }

@@ -8,7 +8,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 
-#define SSVM_VERSION "1.3"
+#define SSVM_VERSION "1.4"
 
 #define SSVM_DIR_ENV     "SSVM_DIR"
 #define SSVM_NO_MKFS_ENV "SSVM_NO_MKFS"
@@ -124,6 +124,8 @@ int                 ssvm_index_save(const struct ssvm_index *ix);
 struct ssvm_subvol *ssvm_index_find(struct ssvm_index *ix, const char *path);
 struct ssvm_subvol *ssvm_index_resolve(struct ssvm_index *ix, const char *ref,
                                        int *nmatch);
+struct ssvm_subvol *ssvm_snap_find(struct ssvm_index *ix, const char *ref,
+                                   int *sidx, int *nmatch);
 int                 ssvm_index_lock(void);
 void                ssvm_index_unlock(int fd);
 

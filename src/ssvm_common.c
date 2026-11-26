@@ -298,7 +298,8 @@ static int lvm_pool_of(const char *dir, const char *vg, const char *lv,
         }
         if (in_target && depth >= 3) {
             char v[SSVM_NAME_MAX];
-            if (sscanf(s, "pool = \"%63[^\"]\"", v) == 1) {
+            if (sscanf(s, "pool = \"%63[^\"]\"", v) == 1 ||
+                sscanf(s, "thin_pool = \"%63[^\"]\"", v) == 1) {
                 snprintf(pool, n, "%s", v);
                 found = 1;
             } else if (sscanf(s, "type = \"%63[^\"]\"", v) == 1 &&
@@ -935,6 +936,55 @@ struct ssvm_subvol *ssvm_index_resolve(struct ssvm_index *ix, const char *ref,
     }
     *nmatch = c;
     return c == 1 ? found : NULL;
+}
+
+static void snap_strip_suffix(char *s)
+{
+    size_t l = strlen(s);
+
+    if (l > 5 && strcmp(s + l - 5, ".sbvs") == 0)
+        s[l - 5] = '\0';
+}
+
+struct ssvm_subvol *ssvm_snap_find(struct ssvm_index *ix, const char *ref,
+                                   int *sidx, int *nmatch)
+{
+    struct ssvm_subvol *found = NULL;
+    char want[SSVM_SNAPNAME_MAX];
+    size_t l = strlen(ref);
+    int c = 0;
+
+    if (sidx)
+        *sidx = -1;
+    *nmatch = 0;
+    if (l == 0 || l >= sizeof want)
+        return NULL;
+    memcpy(want, ref, l + 1);
+    snap_strip_suffix(want);
+    if (!want[0])
+        return NULL;
+
+    for (size_t i = 0; i < ix->n; i++) {
+        for (int s = 0; s < ix->v[i].nsnap; s++) {
+            char nm[SSVM_SNAPNAME_MAX];
+            size_t sl = strlen(ix->v[i].snaps[s].name);
+
+            if (sl == 0 || sl >= sizeof nm)
+                continue;
+            memcpy(nm, ix->v[i].snaps[s].name, sl + 1);
+            snap_strip_suffix(nm);
+            if (strcmp(nm, want) == 0) {
+                if (!found) {
+                    found = &ix->v[i];
+                    if (sidx)
+                        *sidx = s;
+                }
+                c++;
+            }
+        }
+    }
+    *nmatch = c;
+    return found;
 }
 
 int ssvm_index_lock(void)

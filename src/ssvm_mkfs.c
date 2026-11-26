@@ -410,15 +410,18 @@ static int mkfs_ext(struct wr *w, int level, const char *label,
                 goto out;
 
             memset(jsb, 0, sizeof jsb);
-            p32(jsb + 0, 0xc03b3998u);
-            p32(jsb + 4, 4);
-            p32(jsb + 8, 0);
-            p32(jsb + 12, EXT_BS);
-            p32(jsb + 16, g.jblocks);
-            p32(jsb + 20, 1);
-            p32(jsb + 24, 1);
-            p32(jsb + 28, 0);
-            p32(jsb + 64, 1);
+            b32(jsb + 0, 0xc03b3998u);
+            b32(jsb + 4, 4);
+            b32(jsb + 8, 0);
+            b32(jsb + 12, EXT_BS);
+            b32(jsb + 16, g.jblocks);
+            b32(jsb + 20, 1);
+            b32(jsb + 24, 1);
+            b32(jsb + 28, 0);
+            b32(jsb + 32, 0);
+            b32(jsb + 36, 0);
+            memcpy(jsb + 48, uuid, 16);
+            b32(jsb + 64, 1);
             if (wput(w, (uint64_t)g.jstart * EXT_BS, jsb, sizeof jsb) != 0)
                 goto out;
 
@@ -459,7 +462,7 @@ out:
 struct xfsg {
     uint64_t dblocks;
     uint32_t agcount, agsize, agblklog;
-    uint32_t logstart, logblocks;
+    uint32_t logstart, logblocks, chunk;
     uint64_t freeblks;
     unsigned char uuid[16];
 };
@@ -492,6 +495,7 @@ static int xfs_write_dinode(struct wr *w, uint32_t agblock, uint32_t idx,
     b32(b + 76, 0);
     b[81] = 0;
     b16(b + 82, 2);
+    b32(b + 96, 0xFFFFFFFFu);
     if (fork && forklen)
         memcpy(b + 100, fork, forklen);
     return wput(w, (uint64_t)agblock * 4096ull + (uint64_t)idx * 256ull,
@@ -525,6 +529,9 @@ static int mkfs_xfs(struct wr *w, const char *label, uint64_t datalen)
     if (x.logblocks > 2560)
         x.logblocks = 2560;
     x.logstart = 8;
+    x.chunk = x.logstart + x.logblocks;
+    if (x.chunk & 1)
+        x.chunk++;
     raw_uuid(x.uuid);
 
     agfree = calloc(x.agcount, sizeof *agfree);
@@ -537,10 +544,10 @@ static int mkfs_xfs(struct wr *w, const char *label, uint64_t datalen)
         uint32_t agblocks = (ag == x.agcount - 1)
                                 ? (uint32_t)(x.dblocks - agbase)
                                 : x.agsize;
-        uint32_t freestart = (ag == 0) ? x.logstart + x.logblocks : 4;
+        uint32_t freestart = (ag == 0) ? x.chunk + 4 : 4;
 
         agfree[ag] = agblocks - freestart;
-        fdb += agfree[ag];
+        fdb += agfree[ag] + (ag == 0 ? 4u : 0u);
     }
 
     for (ag = 0; ag < x.agcount; ag++) {
@@ -548,7 +555,7 @@ static int mkfs_xfs(struct wr *w, const char *label, uint64_t datalen)
         uint32_t agblocks = (ag == x.agcount - 1)
                                 ? (uint32_t)(x.dblocks - agbase)
                                 : x.agsize;
-        uint32_t freestart = (ag == 0) ? x.logstart + x.logblocks : 4;
+        uint32_t freestart = (ag == 0) ? x.chunk + 4 : 4;
         uint32_t freeblks = agfree[ag];
         uint32_t i;
 
@@ -560,15 +567,15 @@ static int mkfs_xfs(struct wr *w, const char *label, uint64_t datalen)
         b64(b + 24, 0);
         memcpy(b + 32, x.uuid, 16);
         b64(b + 48, x.logstart);
-        b64(b + 56, 64);
-        b64(b + 64, 65);
-        b64(b + 72, 66);
+        b64(b + 56, (uint64_t)x.chunk * 16u);
+        b64(b + 64, (uint64_t)x.chunk * 16u + 1u);
+        b64(b + 72, (uint64_t)x.chunk * 16u + 2u);
         b32(b + 80, 1);
         b32(b + 84, agblocks);
         b32(b + 88, x.agcount);
         b32(b + 92, 0);
         b32(b + 96, x.logblocks);
-        b16(b + 100, 0xB434);
+        b16(b + 100, 0xB4A4);
         b16(b + 102, 512);
         b16(b + 104, 256);
         b16(b + 106, 16);
@@ -580,7 +587,7 @@ static int mkfs_xfs(struct wr *w, const char *label, uint64_t datalen)
         b[124] = (unsigned char)x.agblklog;
         b[126] = 0;
         b[127] = 25;
-        b64(b + 128, 3);
+        b64(b + 128, 64);
         b64(b + 136, 61);
         b64(b + 144, fdb);
         b64(b + 152, 0);
@@ -589,15 +596,15 @@ static int mkfs_xfs(struct wr *w, const char *label, uint64_t datalen)
         b16(b + 176, 0);
         b[178] = 0;
         b[179] = 0;
-        b32(b + 180, 4);
+        b32(b + 180, 2);
         b32(b + 184, 0);
         b32(b + 188, 0);
         b[192] = 0;
-        b[193] = 9;
-        b16(b + 194, 512);
-        b32(b + 196, 0);
-        b32(b + 200, 0x0000000A);
-        b32(b + 204, 0x0000000A);
+        b[193] = 0;
+        b16(b + 194, 0);
+        b32(b + 196, 1);
+        b32(b + 200, 0x0000028A);
+        b32(b + 204, 0x0000028A);
         if (wput(w, agbase * 4096ull, b, 512) != 0)
             goto out;
 
@@ -612,9 +619,9 @@ static int mkfs_xfs(struct wr *w, const char *label, uint64_t datalen)
         b32(b + 28, 1);
         b32(b + 32, 1);
         b32(b + 36, 0);
-        b32(b + 40, 0);
-        b32(b + 44, 0);
-        b32(b + 48, 0);
+        b32(b + 40, ag == 0 ? 1 : 0);
+        b32(b + 44, ag == 0 ? 4 : 0);
+        b32(b + 48, ag == 0 ? 4 : 0);
         b32(b + 52, freeblks);
         b32(b + 56, freeblks);
         b32(b + 60, 0);
@@ -626,53 +633,59 @@ static int mkfs_xfs(struct wr *w, const char *label, uint64_t datalen)
         b32(b + 4, 1);
         b32(b + 8, ag);
         b32(b + 12, agblocks);
-        b32(b + 16, ag == 0 ? 3 : 0);
+        b32(b + 16, ag == 0 ? 64 : 0);
         b32(b + 20, 3);
         b32(b + 24, 1);
         b32(b + 28, ag == 0 ? 61 : 0);
-        b32(b + 32, ag == 0 ? 64 : 0xFFFFFFFFu);
-        b32(b + 36, ag == 0 ? 64 : 0xFFFFFFFFu);
+        b32(b + 32, ag == 0 ? (uint32_t)x.chunk * 16u : 0xFFFFFFFFu);
+        b32(b + 36, 0xFFFFFFFFu);
         for (i = 0; i < 64; i++)
             b32(b + 40 + 4 * i, 0xFFFFFFFFu);
         if (wput(w, agbase * 4096ull + 1024, b, 512) != 0)
             goto out;
 
-        memset(b, 0, 512);
+        memset(b, 0xFF, 512);
+        if (ag == 0) {
+            b32(b + 4, 4);
+            b32(b + 8, 5);
+            b32(b + 12, 6);
+            b32(b + 16, 7);
+        }
         if (wput(w, agbase * 4096ull + 1536, b, 512) != 0)
             goto out;
 
         memset(b, 0, 4096);
         b32(b + 0, 0x41425442u);
-        b32(b + 4, 0);
-        b16(b + 8, 1);
+        b16(b + 4, 0);
+        b16(b + 6, 1);
+        b32(b + 8, 0xFFFFFFFFu);
         b32(b + 12, 0xFFFFFFFFu);
-        b32(b + 16, 0xFFFFFFFFu);
-        b32(b + 20, freestart);
-        b32(b + 24, freeblks);
+        b32(b + 16, freestart);
+        b32(b + 20, freeblks);
         if (wput(w, agbase * 4096ull + 4096, b, 4096) != 0)
             goto out;
 
         memset(b, 0, 4096);
         b32(b + 0, 0x41425443u);
-        b32(b + 4, 0);
-        b16(b + 8, 1);
+        b16(b + 4, 0);
+        b16(b + 6, 1);
+        b32(b + 8, 0xFFFFFFFFu);
         b32(b + 12, 0xFFFFFFFFu);
-        b32(b + 16, 0xFFFFFFFFu);
-        b32(b + 20, freestart);
-        b32(b + 24, freeblks);
+        b32(b + 16, freestart);
+        b32(b + 20, freeblks);
         if (wput(w, agbase * 4096ull + 8192, b, 4096) != 0)
             goto out;
 
         memset(b, 0, 4096);
         b32(b + 0, 0x49414254u);
-        b32(b + 4, 0);
+        b16(b + 4, 0);
+        b16(b + 6, ag == 0 ? 1 : 0);
+        b32(b + 8, 0xFFFFFFFFu);
         b32(b + 12, 0xFFFFFFFFu);
-        b32(b + 16, 0xFFFFFFFFu);
         if (ag == 0) {
-            b16(b + 8, 1);
-            b32(b + 20, 64);
-            b32(b + 24, 61);
-            b64(b + 28, 0xFFFFFFFFFFFFFFF8ull);
+            b32(b + 16, (uint32_t)x.chunk * 16u);
+            b32(b + 20, 61);
+            b64(b + 24, 0xFFFFFFFFFFFFFFF8ull);
         }
         if (wput(w, agbase * 4096ull + 12288, b, 4096) != 0)
             goto out;
@@ -680,19 +693,32 @@ static int mkfs_xfs(struct wr *w, const char *label, uint64_t datalen)
 
     {
         unsigned char fork[6];
+        uint32_t ri = x.chunk * 16u;
+        uint32_t k;
 
         fork[0] = 0;
         fork[1] = 0;
-        fork[2] = 0;
-        fork[3] = 0;
-        fork[4] = 0;
-        fork[5] = 64;
-        if (xfs_write_dinode(w, 4, 0, 0x41ED, 1, 2, 6, fork, 6) != 0)
+        fork[2] = (unsigned char)((ri >> 24) & 0xff);
+        fork[3] = (unsigned char)((ri >> 16) & 0xff);
+        fork[4] = (unsigned char)((ri >> 8) & 0xff);
+        fork[5] = (unsigned char)(ri & 0xff);
+        if (xfs_write_dinode(w, x.chunk, 0, 0x41ED, 1, 2, 6, fork, 6) != 0)
             goto out;
-        if (xfs_write_dinode(w, 4, 1, 0x8180, 2, 1, 0, NULL, 0) != 0)
+        if (xfs_write_dinode(w, x.chunk, 1, 0x8180, 2, 1, 0, NULL, 0) != 0)
             goto out;
-        if (xfs_write_dinode(w, 4, 2, 0x8180, 2, 1, 0, NULL, 0) != 0)
+        if (xfs_write_dinode(w, x.chunk, 2, 0x8180, 2, 1, 0, NULL, 0) != 0)
             goto out;
+        for (k = 3; k < 64; k++) {
+            unsigned char fb[256];
+
+            memset(fb, 0, sizeof fb);
+            b16(fb + 0, 0x494eu);
+            fb[4] = 2;
+            b32(fb + 96, 0xFFFFFFFFu);
+            if (wput(w, (uint64_t)x.chunk * 4096ull + (uint64_t)k * 256ull,
+                      fb, sizeof fb) != 0)
+                goto out;
+        }
     }
 
     rc = 0;

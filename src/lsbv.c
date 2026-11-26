@@ -144,7 +144,7 @@ static void print_long(const struct ssvm_subvol *sv)
         printf("Pending rollback: %s", sv->pendrb);
         if (ssvm_path_join(f, sizeof f, dir, sv->pendrb) != 0 ||
             lstat(f, &st) != 0)
-            printf(" (snapshot file no longer exists)");
+            printf(" (snapshot consumed by the merge)");
         printf("\n");
         printf("  the on-disk image was already restored; %s\n",
                active

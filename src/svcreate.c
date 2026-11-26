@@ -11,18 +11,21 @@
 static void usage(FILE *out)
 {
     fputs(
-"Usage: svcreate [-s SIZE] [-f FSTYPE] [-m MOUNTPOINT] [--tag TAG]... NAME\n"
-"                                                     (SSVM " SSVM_VERSION ")\n"
+"Usage: svcreate [-L SIZE] [-f FSTYPE] [-m MOUNTPOINT] [--tag TAG]... NAME\n"
+"       svcreate -s [-n SNAPNAME] SUBVOL                 (SSVM "
+    SSVM_VERSION ")\n"
 "\n"
 "Creates a subvolume named NAME: a sparse .sbv image in a custom format\n"
 "(1 MiB header + filesystem data region) registered in index.xml.\n"
+"With -s it takes a snapshot of an existing subvolume instead.\n"
 "\n"
 "  NAME        plain subvolume name — the vg/[thin-pool/]lv prefix of\n"
 "              its path is detected automatically from the real LVM\n"
 "              layout where the mountpoint lives (or where the ssvm\n"
 "              directory lives, when -m is not given)\n"
-"  -s SIZE     virtual size (e.g. 512M, 20G, 1T). Without -s, uses all\n"
-"              free space available at creation time (thin provisioning)\n"
+"  -L SIZE     virtual size (e.g. 512M, 20G, 1T). Without -L, uses all\n"
+"              the free space available at creation time (thin\n"
+"              provisioning)\n"
 "  -f FSTYPE   filesystem in the data region: ext2, ext3, ext4, xfs or\n"
 "              f2fs. Default: the filesystem of the host — the one\n"
 "              detected on the ssvm directory — or ext4 when it is not\n"
@@ -33,24 +36,42 @@ static void usage(FILE *out)
 "              refused). LVM detection follows this path. Default: the\n"
 "              mnt/ subdirectory inside the subvolume\n"
 "  --tag TAG   attaches a tag (repeatable)\n"
+"  -s          snapshot: sparse copy (allocated blocks only) of the\n"
+"              current .sbv of SUBVOL to SNAPNAME.sbvs — requires an\n"
+"              INACTIVE subvolume (consistent image)\n"
+"  -n SNAPNAME snapshot name (default: NAME--YYYYMMDD-HHMMSS), unique\n"
+"              among all the registered snapshots\n"
+"  SUBVOL      the snapshot origin: subvolume path\n"
+"              (vg/[thin-pool/]lv/name) or just its name, when unique\n"
 "  -h, --help  this help\n"
 "\n"
-"LVM is mandatory: when no LVM logical volume backs the reference\n"
-"path, svcreate fails with\n"
+"LVM is mandatory when creating a subvolume: when no LVM logical volume\n"
+"backs the reference path, svcreate fails with\n"
 "  E: LVM Usage is Mandatory on the mountpoint.\n"
 "\n"
-"Exit codes: 0 ok · 1 invalid usage · 3 already exists · 4 system error\n",
+"Exit codes: 0 ok · 1 invalid usage · 2 not found · 3 already exists or\n"
+"state conflict · 4 system error\n",
     out);
+}
+
+static void snap_default_name(const char *lv, char *out, size_t n)
+{
+    char ts[32];
+    time_t t = (time_t)ssvm_now();
+    struct tm tm;
+    localtime_r(&t, &tm);
+    strftime(ts, sizeof ts, "%Y%m%d-%H%M%S", &tm);
+    snprintf(out, n, "%s--%s", lv, ts);
 }
 
 int main(int argc, char **argv)
 {
-    int opt, lockfd, ntags = 0, fd;
+    int opt, lockfd, ntags = 0, fd, nm;
+    int snapmode = 0, have_size = 0, fs_from_host = 0;
     uint64_t size = 0;
-    int have_size = 0;
     const char *mp = NULL;
     const char *fstype = NULL;
-    int fs_from_host = 0;
+    const char *snapname = NULL;
     char tags[SSVM_MAX_TAGS][SSVM_TAG_MAX];
     char path[SSVM_PATHSTR_MAX];
     char prefix[SSVM_PATHSTR_MAX];
@@ -71,13 +92,19 @@ int main(int argc, char **argv)
     char sz[32];
 
     opterr = 0;
-    while ((opt = getopt_long(argc, argv, "s:m:f:h", lo, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "L:m:f:sn:h", lo, NULL)) != -1) {
         switch (opt) {
-        case 's':
+        case 'L':
             if (ssvm_parse_size(optarg, &size) != 0)
                 ssvm_die(EXIT_USAGE, "invalid size: %s "
                          "(use 512M, 20G, 1T...)", optarg);
             have_size = 1;
+            break;
+        case 's':
+            snapmode = 1;
+            break;
+        case 'n':
+            snapname = optarg;
             break;
         case 'm':
             mp = optarg;
@@ -110,17 +137,41 @@ int main(int argc, char **argv)
         usage(stderr);
         return EXIT_USAGE;
     }
-    if (strchr(argv[optind], '/'))
-        ssvm_die(EXIT_USAGE, "pass a plain NAME — the vg/[thin-pool/]lv "
-                 "prefix is auto-detected from the mountpoint: %s",
-                 argv[optind]);
-    if (!ssvm_valid_name(argv[optind]))
-        ssvm_die(EXIT_USAGE, "invalid name: %s", argv[optind]);
-    snprintf(name, sizeof name, "%s", argv[optind]);
-    if (mp && !ssvm_valid_mountpoint(mp))
-        ssvm_die(EXIT_USAGE, "invalid mountpoint: %s "
-                 "(absolute path, no '..', not a system directory)",
-                 mp ? mp : "(null)");
+
+    if (snapmode) {
+        if (have_size)
+            ssvm_die(EXIT_USAGE, "-L is not used with -s");
+        if (fstype)
+            ssvm_die(EXIT_USAGE, "-f is not used with -s");
+        if (mp)
+            ssvm_die(EXIT_USAGE, "-m is not used with -s");
+        if (ntags > 0)
+            ssvm_die(EXIT_USAGE, "--tag is not used with -s");
+        snprintf(path, sizeof path, "%s", argv[optind]);
+        if (strchr(path, '/')) {
+            char svg[SSVM_PATHSTR_MAX], stp[SSVM_PATHSTR_MAX];
+            char slv[SSVM_PATHSTR_MAX];
+            if (ssvm_parse_lvpath(path, svg, stp, slv) != 0)
+                ssvm_die(EXIT_USAGE, "invalid path: %s "
+                         "(vg/[tp/]lv/name or a plain unique name)", path);
+        } else if (!ssvm_valid_name(path)) {
+            ssvm_die(EXIT_USAGE, "invalid name: %s", path);
+        }
+    } else {
+        if (snapname)
+            ssvm_die(EXIT_USAGE, "-n is only used with -s");
+        if (strchr(argv[optind], '/'))
+            ssvm_die(EXIT_USAGE, "pass a plain NAME — the vg/[thin-pool/]lv "
+                     "prefix is auto-detected from the mountpoint: %s",
+                     argv[optind]);
+        if (!ssvm_valid_name(argv[optind]))
+            ssvm_die(EXIT_USAGE, "invalid name: %s", argv[optind]);
+        snprintf(name, sizeof name, "%s", argv[optind]);
+        if (mp && !ssvm_valid_mountpoint(mp))
+            ssvm_die(EXIT_USAGE, "invalid mountpoint: %s "
+                     "(absolute path, no '..', not a system directory)",
+                     mp ? mp : "(null)");
+    }
 
     ssvm_require_root();
 
@@ -128,6 +179,176 @@ int main(int argc, char **argv)
     if (ssvm_index_load(&ix) != 0) {
         ssvm_index_unlock(lockfd);
         return EXIT_SYSTEM;
+    }
+
+    if (snapmode) {
+        char svmp[SSVM_MPT_MAX + SSVM_PATHSTR_MAX + 8];
+        char snapfile[SSVM_MPT_MAX + SSVM_PATHSTR_MAX + SSVM_SNAPNAME_MAX + 8];
+        char src[128];
+        char base[SSVM_SNAPNAME_MAX];
+        char sname[SSVM_SNAPNAME_MAX + 32];
+        const char *lvbase;
+        uint64_t copied = 0;
+        struct stat st;
+        struct sbv_hdr sh;
+
+        sv = ssvm_index_resolve(&ix, path, &nm);
+        if (!sv) {
+            ssvm_index_unlock(lockfd);
+            if (nm > 1)
+                ssvm_die(EXIT_USAGE, "ambiguous name: %s — use the full path",
+                         path);
+            ssvm_die(EXIT_NOENT, "no such subvolume: %s", path);
+        }
+        snprintf(path, sizeof path, "%s", sv->path);
+
+        ssvm_sbv_dir(sv, dir, sizeof dir);
+        ssvm_sbv_file(sv, file, sizeof file);
+        ssvm_mp_of(sv, svmp, sizeof svmp);
+        if (ssvm_find_mount(svmp, src, sizeof src)) {
+            ssvm_index_unlock(lockfd);
+            ssvm_die(EXIT_CONFLICT, "%s is active — deactivate before "
+                     "taking a snapshot (svchange -an)", path);
+        }
+        if (ssvm_sbv_read_hdr(file, &hdr) != 0) {
+            ssvm_index_unlock(lockfd);
+            ssvm_sysdie(EXIT_SYSTEM, "cannot read the header of %s", file);
+        }
+        lvbase = strrchr(path, '/') + 1;
+
+        if (snapname) {
+            size_t l = strlen(snapname);
+
+            if (l >= sizeof base)
+                ssvm_die(EXIT_USAGE, "snapshot name too long");
+            if (l > 5 && strcmp(snapname + l - 5, ".sbvs") == 0)
+                l -= 5;
+            memcpy(base, snapname, l);
+            base[l] = '\0';
+            if (!ssvm_valid_name(base))
+                ssvm_die(EXIT_USAGE, "invalid snapshot name: %s", base);
+            {
+                struct ssvm_subvol *ow;
+                int osi, onm;
+
+                ow = ssvm_snap_find(&ix, base, &osi, &onm);
+                if (ow) {
+                    ssvm_index_unlock(lockfd);
+                    ssvm_die(EXIT_CONFLICT, "snapshot name already in use: "
+                             "%s (on %s)", base, ow->path);
+                }
+            }
+            snprintf(sname, sizeof sname, "%s.sbvs", base);
+            if (ssvm_path_join(snapfile, sizeof snapfile, dir, sname) != 0) {
+                ssvm_index_unlock(lockfd);
+                ssvm_die(EXIT_SYSTEM, "path too long");
+            }
+            if (lstat(snapfile, &st) == 0) {
+                ssvm_index_unlock(lockfd);
+                ssvm_die(EXIT_CONFLICT, "snapshot file already exists: %s",
+                         snapfile);
+            }
+            if (errno != ENOENT) {
+                ssvm_index_unlock(lockfd);
+                ssvm_sysdie(EXIT_SYSTEM, "error accessing %s", snapfile);
+            }
+        } else {
+            snap_default_name(lvbase, base, sizeof base);
+            for (int suffix = 0;; suffix++) {
+                struct ssvm_subvol *ow;
+                int osi, onm;
+
+                if (suffix == 0)
+                    snprintf(sname, sizeof sname, "%s.sbvs", base);
+                else
+                    snprintf(sname, sizeof sname, "%s-%d.sbvs",
+                             base, suffix + 1);
+                ow = ssvm_snap_find(&ix, sname, &osi, &onm);
+                if (!ow) {
+                    if (ssvm_path_join(snapfile, sizeof snapfile, dir,
+                                       sname) != 0) {
+                        ssvm_index_unlock(lockfd);
+                        ssvm_die(EXIT_SYSTEM, "path too long");
+                    }
+                    if (lstat(snapfile, &st) != 0 && errno == ENOENT)
+                        break;
+                }
+                if (suffix >= 99) {
+                    ssvm_index_unlock(lockfd);
+                    ssvm_die(EXIT_CONFLICT, "too many snapshots named %s "
+                             "already exist", base);
+                }
+            }
+        }
+
+        ssvm_chattr_i(dir, 0);
+
+        if (ssvm_sparse_copy(file, snapfile, &copied) != 0) {
+            ssvm_chattr_i(dir, 1);
+            ssvm_index_unlock(lockfd);
+            ssvm_sysdie(EXIT_SYSTEM, "failed copying %s to %s", file,
+                        snapfile);
+        }
+
+        sh = hdr;
+        ssvm_uuid(sh.uuid);
+        snprintf(sh.parent, sizeof sh.parent, "%s", hdr.uuid);
+        sh.created = (uint64_t)ssvm_now();
+        sh.flags |= SBV_FLAG_SEALED;
+        if (ssvm_sbv_write_hdr(snapfile, &sh) != 0) {
+            unlink(snapfile);
+            ssvm_chattr_i(dir, 1);
+            ssvm_index_unlock(lockfd);
+            ssvm_sysdie(EXIT_SYSTEM, "error writing the header of %s",
+                        snapfile);
+        }
+
+        hdr.snapcount++;
+        ssvm_sbv_write_hdr(file, &hdr);
+
+        ssvm_chattr_i(snapfile, 1);
+        ssvm_chattr_i(dir, 1);
+
+        {
+            struct ssvm_snap *sn = realloc(sv->snaps,
+                (size_t)(sv->nsnap + 1) * sizeof *sn);
+            if (!sn) {
+                unlink(snapfile);
+                ssvm_chattr_i(dir, 1);
+                ssvm_index_unlock(lockfd);
+                ssvm_die(EXIT_SYSTEM, "out of memory");
+            }
+            sv->snaps = sn;
+            memset(&sv->snaps[sv->nsnap], 0, sizeof *sv->snaps);
+            if (ssvm_strcpy(sv->snaps[sv->nsnap].name,
+                            sizeof sv->snaps[sv->nsnap].name, sname) != 0) {
+                unlink(snapfile);
+                ssvm_chattr_i(dir, 1);
+                ssvm_index_unlock(lockfd);
+                ssvm_die(EXIT_SYSTEM, "snapshot name too long");
+            }
+            snprintf(sv->snaps[sv->nsnap].uuid,
+                     sizeof sv->snaps[sv->nsnap].uuid, "%s", sh.uuid);
+            snprintf(sv->snaps[sv->nsnap].parent,
+                     sizeof sv->snaps[sv->nsnap].parent, "%s", hdr.uuid);
+            sv->snaps[sv->nsnap].size = sv->size;
+            sv->snaps[sv->nsnap].created = ssvm_now();
+            sv->nsnap++;
+        }
+
+        if (ssvm_index_save(&ix) != 0) {
+            ssvm_index_unlock(lockfd);
+            return EXIT_SYSTEM;
+        }
+        ssvm_index_unlock(lockfd);
+
+        ssvm_format_size(copied, sz, sizeof sz);
+        printf("snapshot created: %s\n  %s (%s copied — allocated blocks "
+               "only)\n", path, sname, sz);
+        printf("merge with: svmerge %.*s\n",
+               (int)(strlen(sname) - 5), sname);
+        ssvm_index_free(&ix);
+        return 0;
     }
 
     lvmref = mp ? mp : ssvm_dir();
@@ -168,8 +389,7 @@ int main(int argc, char **argv)
         rounded -= rounded % SBV_CHUNK_SIZE;
         if (rounded != size) {
             ssvm_format_size(rounded, sz, sizeof sz);
-            fprintf(stderr, "svcreate: size rounded up to %s "
-                    "(multiple of 4M)\n", sz);
+            fprintf(stderr, "W: size rounded up to %s (multiple of 4M)\n", sz);
         }
         size = rounded;
     }
@@ -237,7 +457,6 @@ int main(int argc, char **argv)
             ssvm_sysdie(EXIT_SYSTEM, "cannot create %s", dir);
         }
         {
-
             char mntdir[SSVM_MPT_MAX + SSVM_PATHSTR_MAX + 16];
             if (ssvm_path_join(mntdir, sizeof mntdir, dir, "mnt") != 0) {
                 ssvm_index_unlock(lockfd);
@@ -316,7 +535,6 @@ int main(int argc, char **argv)
         ssvm_path_join3(defmp, sizeof defmp, ssvm_dir(), path, "mnt");
         if (strcmp(mp, defmp) != 0)
             snprintf(sv->mountpoint, sizeof sv->mountpoint, "%s", mp);
-
     }
     sv->ntags = ntags;
     for (int i = 0; i < ntags; i++)

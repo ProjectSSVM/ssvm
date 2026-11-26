@@ -6,7 +6,7 @@ LDFLAGS ?=
 PREFIX  ?= /usr/local
 SBINDIR ?= $(PREFIX)/sbin
 
-BINS := lsbv svcreate svchange svremove
+BINS := lsbv svcreate svchange svmerge svremove
 
 all: $(BINS)
 
